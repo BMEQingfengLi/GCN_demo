@@ -18,8 +18,15 @@ class BrainDataset(Dataset):
         self.features = torch.FloatTensor(np.random.randn(num_subjects, num_regions, 3))
 
         # adjacency matrix symmetric normalization
-        degree = torch.sum(adj, dim=2, keepdim=True)
-        self.adj = torch.FloatTensor(adj) / (torch.sqrt(degree) * torch.sqrt(degree.transpose(1, 2) + 1e-8))
+        degree = np.zeros_like(adj)
+        for i in range(adj.shape[0]):
+            degree[i] = np.diag(np.sum(adj[i], axis=1))
+        adj = torch.FloatTensor(adj)
+        degree = torch.FloatTensor(degree)
+        degree_inv_sqrt = torch.pow(degree + 1e-8, -0.5)  # add 1e-8 to avoid value divided by 0
+        degree_inv_sqrt[degree_inv_sqrt == float(torch.inf)] = 0  # in case there are isolated nodes
+
+        self.adj = degree_inv_sqrt * adj * degree_inv_sqrt
 
         # set labels (150 patients: 1, 150 HC: 0)
         self.labels = torch.LongTensor([1] * 150 + [0] * 150)
@@ -37,7 +44,7 @@ class GCNLayer(nn.Module):
         self.linear = nn.Linear(in_dim, out_dim)
 
     def forward(self, x, norm_adj):
-        x = torch.bmm(norm_adj, x)  # batch-wise matrix multiplication
+        x = torch.matmul(norm_adj, x)  # batch-wise matrix multiplication
         return self.linear(x)
 
 
@@ -55,25 +62,36 @@ class BrainGCN(nn.Module):
 
 
 def train():
-    features, adj, labels = generate_brain_data()
-    train_idx = torch.randperm(300)[:210]  # 70% for training
+    dataset = BrainDataset()
+    train_size = int(0.7 * len(dataset))
+
+    train_set, test_set = torch.utils.data.random_split(dataset,
+                                                        [train_size, len(dataset) - train_size])  # 70% for training
+    train_loader = DataLoader(train_set,
+                              batch_size=40,
+                              shuffle=True)
+    test_loader = DataLoader(test_set,
+                             batch_size=10)
 
     model = BrainGCN()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     for epoch in range(400):
-        batch_idx = train_idx[epoch % 10 * 20: (epoch % 10 + 1) * 20]  # batch=20
-        output = model(features[batch_idx], adj[batch_idx])
-        loss = F.nll_loss(output, labels[batch_idx])
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        model.train()
+        for batch_features, batch_adj, batch_labels in train_loader:
+            optimizer.zero_grad()
+            output = model(batch_features, batch_adj)
+            loss = F.nll_loss(output, batch_labels)
+            loss.backward()
+            optimizer.step()
 
         if epoch % 50 == 0:
-            test_output = model(features[~train_idx], adj[~train_idx])  # 30% for testing
-            acc = (test_output.argmax(1) == labels[~train_idx]).float().mean()
-            print(f'Epoch {epoch}, Loss: {loss.item():.4f}, Test Acc: {acc:.4f}')
+            model.eval()
+            correct = 0
+            for batch_features, batch_adj, batch_labels in test_loader:
+                output = model(batch_features, batch_adj)
+                correct += (output.argmax(1) == batch_labels).sum().item()
+            print(f'Epoch {epoch}, Test ACC: {correct / len(test_set):.4f}')
 
 
 if __name__ == '__main__':
